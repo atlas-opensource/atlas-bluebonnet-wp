@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WorkerConnect App</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+        // Firebase Imports (MUST use fixed version and module type)
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection, query, where, updateDoc, arrayUnion, serverTimestamp, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- GLOBAL VARIABLES (Provided by Canvas Environment) ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-worker-app';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        
+        // --- APP STATE ---
+        let db = null;
+        let auth = null;
+        let userId = null;
+        let workerProfile = null;
+        let isAuthReady = false;
+        let currentJob = null;
+        let metadataInterval = null;
+        let cryptoInterval = null;
+        let cryptoData = {};
+        let cryptoRetryDelay = 5000; // Initial retry delay for crypto (5 seconds)
+        let lastCryptoUpdate = 'Never';
+
+        // --- FIREBASE INITIALIZATION AND AUTHENTICATION ---
+        async function initializeFirebase() {
+            setLogLevel('Debug'); // Enable debug logging for Firestore
+            if (Object.keys(firebaseConfig).length === 0) {
+                console.error("Firebase config is missing. Cannot initialize Firebase.");
+                return;
+            }
+            const app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+
+            onAuthStateChanged(auth, async (user) => {
+                if (user) {
+                    userId = user.uid;
+                    if (workerProfile === null) {
+                        // Fetch the worker profile or create a default one
+                        await fetchWorkerProfile();
+                    }
+                    isAuthReady = true;
+                    // Start listeners only after auth is ready
+                    setupFirestoreListeners();
+                    startCryptoFeed();
+                } else {
+                    // Sign in anonymously if token is not available, or with custom token
+                    try {
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(auth, initialAuthToken);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    } catch (error) {
+                        console.error("Authentication failed:", error);
+                        isAuthReady = true; // Mark as ready even if auth fails to avoid infinite loading
+                    }
+                }
+                renderApp();
+            });
+        }
+
+        // --- FIRESTORE UTILITIES ---
+        const getProfileDocRef = () => doc(db, `artifacts/${appId}/users/${userId}/worker_profile`, 'data');
+        const getJobCollectionRef = () => collection(db, `artifacts/${appId}/public/data/jobs_assignments`);
+
+        async function fetchWorkerProfile() {
+            if (!userId) return;
+            try {
+                const docSnap = await getDoc(getProfileDocRef());
+                if (docSnap.exists()) {
+                    workerProfile = docSnap.data();
+                } else {
+                    // Create a placeholder profile for a new user
+                    workerProfile = {
+                        name: 'New Worker',
+                        registered: false,
+                        availability: {},
+                        paymentDetails: { method: 'N/A', account: 'N/A' }
+                    };
+                    await setDoc(getProfileDocRef(), workerProfile);
+                }
+            } catch (e) {
+                console.error("Error fetching worker profile:", e);
+            }
+        }
+
+        function setupFirestoreListeners() {
+            if (!db || !userId || !isAuthReady) return;
+
+            // 1. Worker Profile Listener
+            onSnapshot(getProfileDocRef(), (docSnap) => {
+                if (docSnap.exists()) {
+                    workerProfile = docSnap.data();
+                    renderApp();
+                }
+            }, (error) => console.error("Profile listen error:", error));
+
+            // 2. Job Assignment Listener (Find jobs assigned to this worker)
+            const jobsQuery = query(getJobCollectionRef(), where("assignedToWorkerId", "==", userId));
+            onSnapshot(jobsQuery, (snapshot) => {
+                // Find the latest job that is 'ASSIGNED' or 'ACTIVE'
+                const latestJob = snapshot.docs.map(d => ({ id: d.id, ...d.data() }))
+                    .filter(job => job.status === 'ASSIGNED' || job.status === 'ACTIVE' || job.status === 'COMPLETED_PENDING_PAYMENT')
+                    // Note: Sorting by timestamp.seconds works because timestamps are objects with .seconds property.
+                    .sort((a, b) => (b.timestamp?.seconds || 0) - (a.timestamp?.seconds || 0))[0] || null;
+
+
+                currentJob = latestJob;
+                
+                if (currentJob && currentJob.status === 'ACTIVE' && !metadataInterval) {
+                    startMetadataCollection(currentJob.id);
+                } else if ((!currentJob || currentJob.status !== 'ACTIVE') && metadataInterval) {
+                    stopMetadataCollection();
+                }
+                renderApp();
+            }, (error) => console.error("Job listen error:", error));
+        }
+
+        // --- SIMULATED METADATA COLLECTION ---
+
+        function startMetadataCollection(jobId) {
+            console.log("Starting metadata collection for job:", jobId);
+            stopMetadataCollection(); // Ensure only one interval runs
+            
+            let count = 0;
+            
+            metadataInterval = setInterval(async () => {
+                if (currentJob?.status !== 'ACTIVE' || !userId) {
+                    stopMetadataCollection();
+                    return;
+                }
+                
+                count++;
+                
+                // Simulate real-time GPS update
+                const simulatedLat = 34.0522 + Math.random() * 0.001 * (Math.random() > 0.5 ? 1 : -1);
+                const simulatedLng = -118.2437 + Math.random() * 0.001 * (Math.random() > 0.5 ? 1 : -1);
+                
+                const metadata = {
+                    timestamp: serverTimestamp(),
+                    location: { lat: simulatedLat.toFixed(6), lng: simulatedLng.toFixed(6) },
+                    deviceStatus: { 
+                        battery: Math.min(100, 75 + count * 0.1).toFixed(0) + '%', // Simulate battery usage
+                        network: Math.random() > 0.1 ? '4G/WiFi' : 'Poor'
+                    },
+                    appStatus: 'Foreground Active',
+                    cycle: count,
+                };
+                
+                console.log(`Sending metadata cycle ${count}:`, metadata.location);
+
+                try {
+                    // This simulates the remote server collecting metadata by updating the job document.
+                    await updateDoc(doc(getJobCollectionRef(), jobId), {
+                        lastMetadata: metadata,
+                        metadataHistory: arrayUnion(metadata) // Store a history of metadata points
+                    });
+                } catch (e) {
+                    console.error("Error sending metadata:", e);
+                }
+
+            }, 5000); // Send data every 5 seconds
+        }
+
+        function stopMetadataCollection() {
+            if (metadataInterval) {
+                console.log("Stopping metadata collection.");
+                clearInterval(metadataInterval);
+                metadataInterval = null;
+            }
+        }
+
+        // --- SIMULATED CRYPTO MARKET FEED ---
+
+        function startCryptoFeed() {
+            if (cryptoInterval) clearInterval(cryptoInterval);
+
+            async function fetchCryptoData() {
+                try {
+                    // Simulate a network request and JSON response
+                    const response = await simulateCryptoAPICall();
+                    
+                    if (response.status === 200) {
+                        cryptoData = response.data;
+                        lastCryptoUpdate = new Date().toLocaleTimeString();
+                        cryptoRetryDelay = 5000; // Reset delay on success
+                        renderCryptoPrices();
+                        renderErrorBanner(); // Clear any existing errors
+                    } else {
+                        throw new Error(response.error);
+                    }
+                } catch (error) {
+                    console.warn(`Crypto Feed Error: ${error.message}. Retrying in ${cryptoRetryDelay / 1000}s.`);
+                    renderErrorBanner(true, error.message);
+                    
+                    // Implement Exponential Backoff
+                    cryptoRetryDelay = Math.min(cryptoRetryDelay * 2, 60000); // Max 60 seconds delay
+                }
+                
+                // Set the next interval based on the current delay
+                cryptoInterval = setTimeout(fetchCryptoData, cryptoRetryDelay);
+            }
+
+            // Start the first fetch
+            fetchCryptoData();
+        }
+
+        async function simulateCryptoAPICall() {
+            // Simulate random failure (30% chance of failure, increasing with delay)
+            if (Math.random() < (0.3 + (cryptoRetryDelay / 60000))) {
+                return { status: 500, error: 'Network connection interrupted or rate limit exceeded.' };
+            }
+
+            // Mock JSON data for required currencies
+            const basePrice = 50000 + Math.random() * 5000;
+            const mockData = {
+                'BTC/USD': { price: (basePrice).toFixed(2), volume_24h: '500M', percent_change_24h: (Math.random() * 5 - 2.5).toFixed(2) },
+                'ETH/USD': { price: (basePrice * 0.05).toFixed(2), volume_24h: '200M', percent_change_24h: (Math.random() * 5 - 2.5).toFixed(2) },
+                'XRP/USD': { price: (basePrice * 0.0001).toFixed(4), volume_24h: '10M', percent_change_24h: (Math.random() * 5 - 2.5).toFixed(2) },
+                'ONT/USD': { price: (basePrice * 0.00005).toFixed(4), volume_24h: '5M', percent_change_24h: (Math.random() * 5 - 2.5).toFixed(2) },
+                'ONG/USD': { price: (basePrice * 0.00001).toFixed(4), volume_24h: '2M', percent_change_24h: (Math.random() * 5 - 2.5).toFixed(2) },
+            };
+
+            // Simulate slight delay
+            await new Promise(resolve => setTimeout(resolve, 500));
+            return { status: 200, data: mockData };
+        }
+
+        // --- WORKFLOW ACTIONS (Exposed to window for inline HTML calls) ---
+
+        window.registerWorker = async (name) => {
+            if (!userId) { console.error("User ID not available."); return; }
+            try {
+                await setDoc(getProfileDocRef(), {
+                    name: name,
+                    registered: true,
+                    availability: workerProfile.availability || {},
+                    paymentDetails: workerProfile.paymentDetails || { method: 'N/A', account: 'N/A' }
+                }, { merge: true });
+                renderApp();
+            } catch (e) {
+                console.error("Error registering worker:", e);
+            }
+        };
+
+        window.saveAvailability = async () => {
+            const availabilityInput = document.getElementById('availability-input').value;
+            if (!userId || !availabilityInput) { return; }
+            try {
+                // In a real app, this would parse a complex schedule object. Here, we save the text input.
+                const newAvailability = {
+                    'Mon-Fri': availabilityInput,
+                    updatedAt: serverTimestamp()
+                };
+                await updateDoc(getProfileDocRef(), {
+                    availability: newAvailability
+                });
+                renderApp();
+            } catch (e) {
+                console.error("Error saving availability:", e);
+            }
+        };
+
+        window.acceptJob = async (jobId) => {
+            if (!jobId || !userId) return;
+            try {
+                // Update job status to ACTIVE and record start time
+                await updateDoc(doc(getJobCollectionRef(), jobId), {
+                    status: 'ACTIVE',
+                    workerAcceptedAt: serverTimestamp(),
+                    metadataHistory: [], // Clear any previous metadata history
+                });
+            } catch (e) {
+                console.error("Error accepting job:", e);
+            }
+        };
+
+        window.completeJob = async (jobId) => {
+            if (!jobId || !userId) return;
+            stopMetadataCollection();
+            try {
+                // Update job status to COMPLETED_PENDING_PAYMENT
+                await updateDoc(doc(getJobCollectionRef(), jobId), {
+                    status: 'COMPLETED_PENDING_PAYMENT',
+                    workerCompletedAt: serverTimestamp(),
+                    // This triggers the remote server to start the payment request process
+                });
+            } catch (e) {
+                console.error("Error completing job:", e);
+            }
+        };
+
+        window.savePaymentDetails = async (method, account) => {
+            if (!userId || !method || !account) return;
+            try {
+                const details = {
+                    method: method,
+                    account: account,
+                    updatedAt: serverTimestamp()
+                };
+                await updateDoc(getProfileDocRef(), {
+                    paymentDetails: details
+                });
+                // This simulates the app telling the remote server where to send payment
+                console.log("Payment details sent to remote server via Firestore update.");
+                renderApp();
+            } catch (e) {
+                console.error("Error saving payment details:", e);
+            }
+        };
+
+        // --- RENDERING FUNCTIONS ---
+
+        function renderErrorBanner(isError = false, errorMessage = '') {
+            const container = document.getElementById('error-banner-container');
+            if (!container) return;
+
+            if (isError) {
+                container.innerHTML = `
+                    <div id="crypto-error-banner" class="p-3 bg-red-100 border border-red-400 text-red-700 rounded-lg shadow-md mb-4 flex justify-between items-center transition-all duration-300">
+                        <p class="text-sm font-medium">
+                            🚨 Market Data Error: ${errorMessage || 'Failed to connect to real-time feed.'} Retrying in ${cryptoRetryDelay / 1000}s.
+                        </p>
+                        <button onclick="document.getElementById('crypto-error-banner').style.display='none'" class="text-red-500 hover:text-red-800 ml-4 font-bold">
+                            &times;
+                        </button>
+                    </div>
+                `;
+            } else {
+                container.innerHTML = '';
+            }
+        }
+
+        function renderCryptoPrices() {
+            const container = document.getElementById('crypto-prices-container');
+            if (!container) return;
+            
+            const coins = ['BTC/USD', 'ETH/USD', 'XRP/USD', 'ONT/USD', 'ONG/USD'];
+            
+            const cryptoCards = coins.map(symbol => {
+                const data = cryptoData[symbol];
+                const price = data?.price || 'Loading...';
+                const change = data?.percent_change_24h || 'N/A';
+                const color = change === 'N/A' ? 'text-gray-500' : (parseFloat(change) >= 0 ? 'text-green-500' : 'text-red-500');
+                const sign = change === 'N/A' ? '' : (parseFloat(change) >= 0 ? '▲' : '▼');
+                
+                return `
+                    <div class="p-3 bg-white rounded-lg shadow-inner flex justify-between items-center text-sm border border-gray-100">
+                        <div class="font-semibold text-gray-700">${symbol.split('/')[0]}</div>
+                        <div class="text-right">
+                            <div class="font-bold text-gray-800">$${price}</div>
+                            <div class="${color} text-xs">${sign} ${change}%</div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+            
+            container.innerHTML = `
+                <div class="text-xs text-gray-500 mb-2">Live Market Data (Last Update: ${lastCryptoUpdate})</div>
+                <div class="grid grid-cols-2 sm:grid-cols-3 gap-3">${cryptoCards}</div>
+            `;
+        }
+
+
+        function renderDashboard() {
+            let content = '';
+            
+            // --- ACTIVE JOB VIEW ---
+            if (currentJob && currentJob.status === 'ACTIVE') {
+                const lastMeta = currentJob.lastMetadata;
+                content = `
+                    <div class="p-6 bg-red-50 border-l-4 border-red-500 rounded-lg shadow-xl mb-6">
+                        <h2 class="text-2xl font-bold text-red-700 mb-2">🔴 Active Job: ${currentJob.customerIdentifier || 'GUEST-001'}</h2>
+                        <p class="text-lg text-red-600 mb-4">${currentJob.description || 'Perform general maintenance tasks.'}</p>
+                        <div class="grid grid-cols-2 gap-4 text-sm text-gray-700 p-4 bg-white rounded-lg border">
+                            <div><span class="font-semibold">Start Time:</span> ${new Date(currentJob.workerAcceptedAt.seconds * 1000).toLocaleTimeString()}</div>
+                            <div><span class="font-semibold">Est. Duration:</span> ${currentJob.durationHours || 1} Hour(s)</div>
+                            <div><span class="font-semibold">Worker ID:</span> ${userId}</div>
+                            <div><span class="font-semibold">Customer ID:</span> <span class="text-red-600">${currentJob.customerIdentifier}</span></div>
+                        </div>
+                        
+                        <div class="mt-6 p-4 bg-gray-100 rounded-lg">
+                            <h3 class="text-lg font-semibold mb-2 text-gray-800">Metadata Tracking (Simulated)</h3>
+                            ${lastMeta ? `
+                                <div class="text-sm space-y-1">
+                                    <p><span class="font-medium">Time Ping:</span> ${new Date(lastMeta.timestamp.seconds * 1000).toLocaleTimeString()} (Every 5s)</p>
+                                    <p><span class="font-medium">Location:</span> Lat ${lastMeta.location.lat}, Lng ${lastMeta.location.lng}</p>
+                                    <p><span class="font-medium">Battery:</span> ${lastMeta.deviceStatus.battery}</p>
+                                    <p><span class="font-medium">Cycle:</span> ${lastMeta.cycle}</p>
+                                </div>
+                            ` : `<p class="text-sm text-gray-500">Metadata collection starting...</p>`}
+                        </div>
+
+                        <button onclick="completeJob('${currentJob.id}')"
+                            class="mt-6 w-full py-3 bg-red-600 text-white font-bold rounded-xl shadow-lg hover:bg-red-700 transition duration-150 transform hover:scale-[1.01]">
+                            ✅ Mark Job as Completed
+                        </button>
+                    </div>
+                `;
+            } 
+            // --- ASSIGNED JOB VIEW ---
+            else if (currentJob && currentJob.status === 'ASSIGNED') {
+                 content = `
+                    <div class="p-6 bg-yellow-50 border-l-4 border-yellow-500 rounded-lg shadow-xl mb-6">
+                        <h2 class="text-2xl font-bold text-yellow-700 mb-2">⭐ New Job Assignment Received</h2>
+                        <p class="text-lg text-yellow-600 mb-4">${currentJob.description || 'General service task required.'}</p>
+                        <div class="text-sm text-gray-700 p-4 bg-white rounded-lg border border-yellow-200">
+                            <p><span class="font-semibold">Customer ID:</span> ${currentJob.customerIdentifier || 'Unknown'}</p>
+                            <p><span class="font-semibold">Estimated Work:</span> ${currentJob.durationHours || 1} Hour</p>
+                        </div>
+
+                        <button onclick="acceptJob('${currentJob.id}')"
+                            class="mt-6 w-full py-3 bg-green-500 text-white font-bold rounded-xl shadow-lg hover:bg-green-600 transition duration-150 transform hover:scale-[1.01]">
+                            Accept Work Request
+                        </button>
+                    </div>
+                `;
+            } 
+            // --- PENDING/COMPLETED JOB VIEW ---
+            else if (currentJob && currentJob.status === 'COMPLETED_PENDING_PAYMENT') {
+                content = `
+                    <div class="p-6 bg-blue-50 border-l-4 border-blue-500 rounded-lg shadow-xl mb-6">
+                        <h2 class="text-2xl font-bold text-blue-700 mb-2">⏳ Job Completed - Payment Pending</h2>
+                        <p class="text-lg text-blue-600 mb-4">You have completed this job. The remote server is now requesting payment from the client.</p>
+                        <p class="text-sm text-gray-600">Please ensure your payment details are up to date in the 'Payment' tab.</p>
+                        <div class="mt-4 text-xs text-gray-500">Job ID: ${currentJob.id}</div>
+                    </div>
+                `;
+            }
+            // --- NO ACTIVE JOB VIEW ---
+            else {
+                content = `
+                    <div class="p-6 bg-gray-50 rounded-xl text-center shadow-inner">
+                        <h2 class="text-2xl font-bold text-gray-700 mb-2">Relax!</h2>
+                        <p class="text-gray-500 mb-4">No active or assigned work requests at the moment.</p>
+                        <p class="text-sm font-semibold text-indigo-600">Make sure your availability is set correctly.</p>
+                    </div>
+                `;
+            }
+
+            return `
+                <div class="space-y-6">
+                    ${content}
+                    <div class="p-5 bg-indigo-50 rounded-xl shadow-md">
+                        <h3 class="text-xl font-bold text-indigo-700 mb-3">Live Crypto Market Status</h3>
+                        <div id="crypto-prices-container" class="space-y-3">
+                            <!-- Crypto prices rendered by renderCryptoPrices() -->
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderAvailability() {
+            const currentAvailability = workerProfile?.availability?.['Mon-Fri'] || 'No availability set yet.';
+            
+            return `
+                <div class="p-6 bg-white rounded-xl shadow-lg border border-indigo-200">
+                    <h2 class="text-2xl font-bold text-indigo-700 mb-4">Set Your Availability</h2>
+                    <p class="text-sm text-gray-500 mb-6">Tell us when you are ready to work. (e.g., Mon-Fri, 9am - 5pm EST)</p>
+                    
+                    <div class="mb-4">
+                        <label for="availability-input" class="block text-sm font-medium text-gray-700 mb-2">Current Availability</label>
+                        <textarea id="availability-input" rows="4" class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 text-gray-800" placeholder="e.g., Every weekday from 8:00 AM to 4:00 PM">${currentAvailability === 'No availability set yet.' ? '' : currentAvailability}</textarea>
+                    </div>
+                    
+                    <button onclick="saveAvailability()"
+                        class="w-full py-3 bg-indigo-600 text-white font-bold rounded-xl shadow-md hover:bg-indigo-700 transition duration-150">
+                        💾 Save Availability
+                    </button>
+                    
+                    <div class="mt-6 pt-4 border-t border-gray-200">
+                        <h3 class="text-lg font-semibold text-gray-800">Current Status</h3>
+                        <p class="mt-2 text-gray-600">${currentAvailability}</p>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderPayment() {
+            const details = workerProfile?.paymentDetails || { method: 'N/A', account: 'N/A' };
+            const isPaymentReady = details.method !== 'N/A';
+            
+            return `
+                <div class="p-6 bg-white rounded-xl shadow-lg border border-indigo-200">
+                    <h2 class="text-2xl font-bold text-indigo-700 mb-4">Payout Destination</h2>
+                    <p class="text-sm text-gray-500 mb-6">This is where the remote server will send your earnings after job completion.</p>
+                    
+                    <form id="payment-form" onsubmit="event.preventDefault(); savePaymentDetails(document.getElementById('payout-method').value, document.getElementById('account-details').value);">
+                        <div class="mb-4">
+                            <label for="payout-method" class="block text-sm font-medium text-gray-700 mb-2">Payout Method (e.g., Bank Transfer, Crypto Wallet)</label>
+                            <input type="text" id="payout-method" value="${details.method !== 'N/A' ? details.method : ''}" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 text-gray-800" placeholder="e.g., BTC Wallet, Payoneer, Bank">
+                        </div>
+                        <div class="mb-6">
+                            <label for="account-details" class="block text-sm font-medium text-gray-700 mb-2">Account Details / Wallet Address</label>
+                            <input type="text" id="account-details" value="${details.account !== 'N/A' ? details.account : ''}" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 text-gray-800" placeholder="e.g., YourIBAN, WalletAddress123...">
+                        </div>
+                        
+                        <button type="submit"
+                            class="w-full py-3 bg-green-600 text-white font-bold rounded-xl shadow-md hover:bg-green-700 transition duration-150">
+                            💰 Submit Payout Details
+                        </button>
+                    </form>
+                    
+                    <div class="mt-8 p-4 border border-${isPaymentReady ? 'green-300' : 'red-300'} bg-${isPaymentReady ? 'green-50' : 'red-50'} rounded-lg">
+                        <h3 class="text-lg font-semibold text-gray-800">Current Saved Details</h3>
+                        <p class="mt-2 text-sm text-gray-600">Method: <span class="font-medium">${details.method}</span></p>
+                        <p class="text-sm text-gray-600">Account: <span class="font-medium">${details.account}</span></p>
+                        ${!isPaymentReady ? '<p class="text-xs text-red-500 mt-2 font-semibold">ACTION REQUIRED: Payment details are mandatory to receive funds!</p>' : ''}
+                    </div>
+                </div>
+            `;
+        }
+
+        // --- MAIN APP RENDERER ---
+
+        let activeView = 'dashboard';
+        window.switchView = (view) => {
+            activeView = view;
+            renderApp();
+        };
+
+        function renderApp() {
+            const appContainer = document.getElementById('app');
+            if (!appContainer) return;
+            
+            // --- AUTH/REGISTRATION CHECK ---
+            if (!isAuthReady || !workerProfile) {
+                appContainer.innerHTML = `<div class="p-10 text-center text-gray-500">Loading worker profile...</div>`;
+                return;
+            }
+
+            if (!workerProfile.registered) {
+                appContainer.innerHTML = `
+                    <div class="max-w-md mx-auto p-8 bg-white rounded-xl shadow-2xl mt-12">
+                        <h1 class="text-3xl font-extrabold text-indigo-600 mb-4">Worker Registration</h1>
+                        <p class="text-gray-600 mb-6">Welcome! Please register to start receiving assignments.</p>
+                        <form onsubmit="event.preventDefault(); registerWorker(document.getElementById('worker-name').value);">
+                            <label for="worker-name" class="block text-sm font-medium text-gray-700 mb-2">Your Full Name</label>
+                            <input type="text" id="worker-name" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 mb-6" placeholder="Jane Doe">
+                            <button type="submit" class="w-full py-3 bg-indigo-600 text-white font-bold rounded-xl shadow-lg hover:bg-indigo-700 transition duration-150">
+                                Register and Start Working
+                            </button>
+                        </form>
+                    </div>
+                `;
+                return;
+            }
+            
+            // --- MAIN APP STRUCTURE ---
+            let viewContent = '';
+            switch(activeView) {
+                case 'availability': viewContent = renderAvailability(); break;
+                case 'payment': viewContent = renderPayment(); break;
+                case 'dashboard':
+                default: viewContent = renderDashboard(); break;
+            }
+
+            const navItem = (view, icon, label) => `
+                <button onclick="switchView('${view}')" class="flex-1 p-3 text-center border-b-2 transition-colors duration-150 
+                    ${activeView === view ? 'border-indigo-600 text-indigo-600 font-bold' : 'border-transparent text-gray-500 hover:text-indigo-500'}"
+                >
+                    <i class="fas ${icon} mr-1"></i> ${label}
+                </button>
+            `;
+
+            appContainer.innerHTML = `
+                <div class="min-h-screen bg-gray-50 font-sans antialiased">
+                    <!-- Top Bar -->
+                    <div class="p-4 bg-white shadow-md">
+                        <div class="max-w-4xl mx-auto flex justify-between items-center">
+                            <h1 class="text-2xl font-extrabold text-indigo-700">WorkerConnect</h1>
+                            <div class="text-xs text-gray-500 text-right">
+                                <p>Welcome, <span class="font-semibold text-gray-800">${workerProfile.name}</span></p>
+                                <p class="truncate">Worker ID: ${userId}</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Navigation -->
+                    <div class="bg-white shadow-inner sticky top-0 z-10">
+                        <div class="max-w-4xl mx-auto flex">
+                            ${navItem('dashboard', 'fa-tachometer-alt', 'Dashboard')}
+                            ${navItem('availability', 'fa-calendar-alt', 'Availability')}
+                            ${navItem('payment', 'fa-wallet', 'Payment')}
+                        </div>
+                    </div>
+                    
+                    <!-- Error Banner Container -->
+                    <div id="error-banner-container" class="max-w-4xl mx-auto mt-4 px-4 sm:px-0">
+                        <!-- Rendered by renderErrorBanner() -->
+                    </div>
+
+                    <!-- Main Content -->
+                    <main class="max-w-4xl mx-auto p-4 sm:p-6 pb-20">
+                        ${viewContent}
+                    </main>
+                </div>
+            `;
+            
+            // Post-render updates
+            renderCryptoPrices();
+            renderErrorBanner(); // Initial render to ensure no old error persists if successful
+        }
+
+        // --- EXECUTION START ---
+        document.addEventListener('DOMContentLoaded', initializeFirebase);
+    </script>
+    <!-- Font Awesome for Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.3/css/all.min.css"></link>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+    </style>
+</head>
+<body>
+    <div id="app">
+        <!-- Content dynamically loaded here -->
+    </div>
+</body>
+</html>
