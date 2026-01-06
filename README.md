@@ -23,8 +23,10 @@ Once the remote server has completed verifying that the work was completed it ca
 The employer can then use the app to post payment. At this point the app and the remote server will act as a payment gateway (authorize.net for example) which take the alloted sum from the employer's specified account. The app and remote server will store the fiscal dollars in a merchant account. The merchant account will then be instructed by the app to transfer the funds to the account specified by the worker. 
 
 This last part is highly configurable and and could for example be implemented with Stripe, Paypal, CashApp, Venmo, or other API's. 
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
  
-The following is a brief business analyst perspective of the app: 
+The following is another brief business analyst perspective of the app: 
 ------------------------------------------------------------------
 
 The app needs to wait for a remote server to assign a given worker a set number of hours of work (1 hour by default). The app needs to receive a basic identifier unique to the employer from a remote server. When the work request is received the app needs to assign it to a worker. The worker must accept the work request. The worker must then perform the task the app has assigned it in the real world while a series of remote systems collect their metadata. The app then needs to allow the worker to tell it when the job is completed. When the worker tells it the job is completed the remote server will request payment from the work recipient or employer. The worker can then tell the app where to send their payment. The app will tell the employer where to send the payment. The app then allows the employer to post payment to the worker's specified account. The app then posts a message notifying the worker that their payment has been posted.
