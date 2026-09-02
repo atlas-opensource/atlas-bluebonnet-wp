@@ -32,6 +32,10 @@ Recommended first version:
   - Payment providers
   - Email/SMS/push notifications
 
+The loading network is outside the app's trust boundary. It is a separate legal and technical entity operating where the worker performs the task. Its equipment collects worker or employee information and connects independently to the WAN. Neither the app frontend nor the app backend has network access, credentials, administrative control, command capability, or a direct integration with the loading network.
+
+The loading network may independently publish signed or otherwise attributable records to a public blockchain, an indexing service, or another WAN-accessible data provider. The app backend can only query those externally published records through read-only provider adapters, subject to the provider's access terms. It must not assume that a record exists, is complete, or was produced honestly merely because it is publicly visible.
+
 The client should never directly mutate job status, payment data, or verification results in Firestore. The server should authorize and record every transition.
 
 ## 3. Model the core domain
@@ -50,7 +54,7 @@ Key entities:
 - `Assignment`
   - Worker, employer, acceptance, start, completion, and current status
 - `EvidenceRecord`
-  - Metadata source, timestamp, worker identifier, transaction reference, integrity hash
+  - External source, timestamp, opaque worker identifier, transaction reference, integrity hash, retrieval details
 - `VerificationJob`
   - Requested, processing, passed, failed, needs review
 - `Payment`
@@ -59,7 +63,7 @@ Key entities:
   - Immutable record of important actions and external responses
 - `Notification`
 
-Use a server-generated opaque worker identifier in external metadata. Do not expose email addresses, legal names, or payment information to blockchain networks.
+Use a server-generated opaque worker identifier for the assignment and make it available to the worker and employer under the product's privacy rules. The loading network is responsible for deciding how it associates that identifier with its independently collected records; the app does not transmit commands or metadata to it. Do not expose email addresses, legal names, or payment information to the loading network, blockchain networks, or public data providers.
 
 ## 4. Define the assignment state machine
 
@@ -124,22 +128,24 @@ Use authenticated sessions, role-based authorization, request validation, rate l
 
 When an assignment is accepted:
 
-1. Backend creates a verification session.
-2. A provider or loading network receives the external worker identifier.
-3. Metadata is collected by an approved integration.
-4. The integration submits evidence references and transaction IDs.
-5. A worker process retrieves and normalizes the evidence.
-6. Rules validate time, worker identity, task requirements, and data integrity.
-7. Optional AI analysis produces a recommendation with confidence and explanation.
-8. Low-confidence or failed cases go to manual review.
+1. Backend creates a verification job and records the opaque assignment identifier.
+2. The worker performs the task while the independent loading network operates at the work location and collects information under its own legal authority, policies, and technical controls.
+3. The loading network independently connects to the WAN and may publish records containing the relevant opaque identifier to a blockchain or other external data provider. The app does not initiate, configure, monitor, or control this collection.
+4. After the worker submits the assignment, a backend worker queries approved public or authorized indexing endpoints for records matching the assignment identifier and time window.
+5. The backend stores the returned records and provenance, then normalizes them without altering the original evidence.
+6. Rules validate source authenticity, identifier matching, timestamps, task requirements, data integrity, and the limitations of the external source.
+7. Optional AI analysis produces a recommendation with confidence and explanation; it does not replace source validation or human review.
+8. Low-confidence, unavailable, contradictory, or failed evidence goes to manual review rather than being treated as proof of misconduct or completion.
 9. The final decision is written to the assignment and audit log.
 
 Important safeguards:
 
-- Never treat a blockchain transaction alone as proof that work was performed.
-- Store provider name, network, transaction hash, block height, retrieval time, and evidence hash.
-- Make verification reproducible and version the rules/model used.
-- Avoid collecting precise location or behavioral data unless necessary and consented to.
+- Never treat a blockchain transaction or loading-network record alone as proof that work was performed.
+- Treat the loading network as an untrusted external source: record its legal entity, declared provenance, publication endpoint, and known limitations, but do not grant it app credentials or inbound access.
+- Store provider name, network, transaction hash, block height, retrieval time, response metadata, and evidence hash.
+- Preserve the original externally retrieved payload separately from normalized data and make verification reproducible by versioning the rules and model used.
+- Handle missing, delayed, changed, or unavailable public records explicitly; absence of evidence must not silently become evidence of absence.
+- Avoid collecting precise location or behavioral data in the app unless necessary and consented to. The loading network's collection requires separate notice, consent, and legal review by that entity.
 
 ## 7. Add payment processing
 
@@ -197,11 +203,12 @@ Before collecting real worker data or money:
 
 - Define terms of service and privacy policy
 - Establish worker consent for location/device metadata
+- Clearly disclose that the app does not operate or control the loading network, what externally published records may be queried, and how those records affect review or payment
 - Provide data retention and deletion controls
 - Address employment classification and wage/payment regulations
 - Confirm money-transmission, KYC, AML, tax, and marketplace obligations
 - Enforce the README’s prohibition on employing minors through age verification and eligibility rules
-- Threat-model spoofed metadata, replayed transactions, account takeover, fraudulent employers, and payment disputes
+- Threat-model spoofed or fabricated external records, replayed transactions, identifier collisions, provider compromise, inaccessible or withdrawn records, account takeover, fraudulent employers, and payment disputes
 - Add encryption in transit and at rest, secret management, least-privilege access, and immutable audit logs
 
 Legal review is required before launch because this system combines labor coordination, behavioral monitoring, verification, and payments.
@@ -236,10 +243,10 @@ Operational requirements:
 3. Implement employer work requests and worker assignment flows.
 4. Add the assignment state machine and notifications.
 5. Add a mock verification provider behind a stable adapter interface.
-6. Add evidence storage, verification jobs, retries, and manual review.
+6. Add evidence storage, read-only external-provider verification jobs, retries, and manual review.
 7. Integrate one real payment provider in sandbox mode.
-8. Add one real metadata/blockchain provider.
+8. Add one real public-ledger or indexing provider as a read-only evidence source; do not integrate directly with the loading network.
 9. Add compliance controls, security review, accessibility, and observability.
 10. Pilot with synthetic jobs and a small approved user group before handling real funds.
 
-The first concrete milestone should be a vertical slice: an employer creates a job, a worker accepts and submits it, a mock verifier returns a result, and a sandbox payment completes. That will validate the core architecture before investing in multiple blockchain networks or AI verification.
+The first concrete milestone should be a vertical slice: an employer creates a job, a worker accepts and submits it, a mock read-only external evidence provider returns a result or an unavailable result, and a sandbox payment completes only for a verified case. That will validate the trust boundary and failure handling before investing in multiple blockchain networks or AI verification.
