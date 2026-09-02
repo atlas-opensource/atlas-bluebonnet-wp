@@ -1,4 +1,4 @@
-Please note that it is illegal to hire minors, as it is a violation of child labor laws especially in the State of Texas
+Please note that it is illegal to hire minors, as it is a violation of child labor laws especially in the State of Texas.
 
 This example app tracks labor based on the work reqester or employer, a data source and a worker. It is designed to allow metadata processing systems and public ledgers like blockchains, to be the primary means of tracking work and validating work.
 
