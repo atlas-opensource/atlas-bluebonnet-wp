@@ -28,6 +28,9 @@
         let cryptoData = {};
         let cryptoRetryDelay = 5000; // Initial retry delay for crypto (5 seconds)
         let lastCryptoUpdate = 'Never';
+        const appState = {
+            'bb-app-debug-on': false
+        };
 
         // --- FIREBASE INITIALIZATION AND AUTHENTICATION ---
         async function initializeFirebase() {
@@ -613,7 +616,10 @@
         }
 
         // --- EXECUTION START ---
-        document.addEventListener('DOMContentLoaded', initializeFirebase);
+        document.addEventListener('DOMContentLoaded', () => {
+            if (appState['bb-app-debug-on']) return;
+            initializeFirebase();
+        });
     </script>
     <!-- Font Awesome for Icons -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.3/css/all.min.css"></link>
