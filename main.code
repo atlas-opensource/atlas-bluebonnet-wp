@@ -29,7 +29,7 @@
         let cryptoRetryDelay = 5000; // Initial retry delay for crypto (5 seconds)
         let lastCryptoUpdate = 'Never';
         const appState = {
-            'bb-app-debug-on': false
+            'bb-app-debug-on': true
         };
 
         // --- FIREBASE INITIALIZATION AND AUTHENTICATION ---
